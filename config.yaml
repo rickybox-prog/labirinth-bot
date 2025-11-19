@@ -1,6 +1,3 @@
-bot_token: "INSERISCI_QUI_IL_TUO_TOKEN"
-deepl_key: "INSERISCI_LA_TUA_CHIAVE_DEEPL_GRATIS"
-
 channels:
   main: "@LabirinthIT"
   ai: "@LabirinthAI"
