@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import feedparser
 import yaml
 import deepl
@@ -6,9 +7,10 @@ import ollama
 import os
 import json
 import torch
-from datetime import datetime
+import time
+from datetime import datetime, date, timezone, timedelta
 from aiogram import Bot
-from aiogram.types import InputFile
+from aiogram.types import FSInputFile
 from dotenv import load_dotenv
 from diffusers import FluxPipeline
 from huggingface_hub import login
@@ -27,17 +29,81 @@ bot = Bot(token=os.getenv("BOT_TOKEN"))
 translator = deepl.Translator(os.getenv("DEEPL_KEY"))
 
 SEEN_FILE = "seen.txt"
-seen_ids = set(open(SEEN_FILE).read().splitlines()) if os.path.exists(SEEN_FILE) else set()
+POST_COUNT_FILE = "daily_posts.json"
+MAX_DAILY_POSTS = 5  # cambialo a 4 se vuoi più stretto
+
+seen_ids = set()
+if os.path.exists(SEEN_FILE):
+    with open(SEEN_FILE) as f:
+        seen_ids = {line.strip() for line in f if line.strip()}
 
 category_map = {"AI": "ai", "CYBER": "cyber", "HARDWARE": "hardware"}
+
+def load_daily_count():
+    today = str(date.today())
+    if os.path.exists(POST_COUNT_FILE):
+        try:
+            with open(POST_COUNT_FILE) as f:
+                data = json.load(f)
+                if data.get("date") == today:
+                    return data.get("count", 0)
+        except:
+            pass
+    return 0
+
+def increment_daily_count():
+    today = str(date.today())
+    count = load_daily_count() + 1
+    with open(POST_COUNT_FILE, "w") as f:
+        json.dump({"date": today, "count": count}, f)
 
 async def process_entry(entry, feed_name):
     entry_id = entry.link
     if entry_id in seen_ids:
         return
 
+    # === FILTRO DATA <96 ore ===
+    pub_date = None
+    if 'published_parsed' in entry:
+        try:
+            pub_date = datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc)
+        except:
+            pass
+    elif 'updated_parsed' in entry:
+        try:
+            pub_date = datetime.fromtimestamp(time.mktime(entry.updated_parsed), tz=timezone.utc)
+        except:
+            pass
+
+    # fallback su stringa published/updated
+    if not pub_date and (entry.get("published") or entry.get("updated")):
+        pub_str = entry.get("published") or entry.get("updated")
+        # tenta alcuni formati comuni
+        for fmt in (
+            "%a, %d %b %Y %H:%M:%S %z",
+            "%a, %d %b %Y %H:%M:%S %Z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%SZ",
+        ):
+            try:
+                pub_date = datetime.strptime(pub_str, fmt)
+                if pub_date.tzinfo is None:
+                    pub_date = pub_date.replace(tzinfo=timezone.utc)
+                break
+            except:
+                pass
+
+    if pub_date and (datetime.now(timezone.utc) - pub_date) > timedelta(hours=96):
+        print(f"Scartata (troppo vecchia): {entry.title}")
+        return
+
+    # === LIMITE POST GIORNALIERI ===
+    if load_daily_count() >= MAX_DAILY_POSTS:
+        print("Limite giornaliero raggiunto – salta post")
+        return
+
     title_en = entry.title
-    summary_en = entry.summary if 'summary' in entry else entry.get('description', '')
+    summary_en = entry.summary if "summary" in entry else entry.get("description", "")
     link = entry.link
 
     prompt = f"""Sei l'editor italiano di Labirinth. Tono underground ma professionale.
@@ -55,8 +121,8 @@ Rispondi SOLO con JSON valido:
     response = None
     for _ in range(6):
         try:
-            resp = ollama.chat(model='llama3.1:8b', messages=[{'role': 'user', 'content': prompt}])
-            response = resp['message']['content'].strip()
+            resp = ollama.chat(model="llama3.1:8b", messages=[{"role": "user", "content": prompt}])
+            response = resp["message"]["content"].strip()
             if response:
                 break
         except Exception as e:
@@ -68,7 +134,8 @@ Rispondi SOLO con JSON valido:
 
     try:
         result = json.loads(response)
-    except:
+    except Exception as e:
+        print(f"JSON error: {e}")
         return
 
     if result.get("category") == "IGNORE":
@@ -91,7 +158,7 @@ Rispondi SOLO con JSON valido:
 
     posted = await bot.send_photo(
         chat_id=config["channels"][cat_key],
-        photo=InputFile(temp_path),
+        photo=FSInputFile(temp_path),
         caption=full_message,
         parse_mode="Markdown"
     )
@@ -102,52 +169,28 @@ Rispondi SOLO con JSON valido:
 
     await bot.send_message(config["channels"]["main"], teaser, parse_mode="Markdown", disable_web_page_preview=True)
 
+    # incrementa solo dopo aver postato con successo
+    increment_daily_count()
+
     seen_ids.add(entry_id)
-    open(SEEN_FILE, "a").write(entry_id + "\n")
+    with open(SEEN_FILE, "a") as f:
+        f.write(entry_id + "\n")
     os.remove(temp_path)
 
-    print(f"POSTATO → {title_it} [{result['category']}]")
+    print(f"POSTATO → {title_it} [{result['category']}] ({load_daily_count()}/{MAX_DAILY_POSTS} oggi)")
 
 async def main_loop():
     while True:
-        print(f"{datetime.now()} → Scan feed... ({len(seen_ids)} già pubblicate)")
+        today = str(date.today())
+        print(f"{datetime.now()} → Scan feed... ({len(seen_ids)} già pubblicate, {load_daily_count()}/{MAX_DAILY_POSTS} oggi)")
         for feed in config["feeds"]:
             try:
                 d = feedparser.parse(feed["url"])
-                for entry in reversed(d.entries[:20]):
+                for entry in reversed(d.entries[:20]):  # reversed così le più vecchie del batch escono prima
                     await process_entry(entry, feed["name"])
             except Exception as e:
                 print(f"Errore feed: {e}")
-        await asyncio.sleep(1800)
+        await asyncio.sleep(1800)  # 30 min
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())  print(f"Errore feed: {e}")
-        await asyncio.sleep(1800)
-
-if __name__ == "__main__":
-    asyncio.run(main_loop())  print(f"Errore feed: {e}")
-        await asyncio.sleep(1800)
-
-if __name__ == "__main__":
-    asyncio.run(main_loop())  print(f"Errore feed: {e}")
-        await asyncio.sleep(1800)
-
-if __name__ == "__main__":
-    asyncio.run(main_loop())   print(f"Errore feed: {e}")
-        await asyncio.sleep(1800)
-
-if __name__ == "__main__":
-    asyncio.run(main_loop())  print(f"Errore feed: {e}")
-        await asyncio.sleep(1800)
-
-if __name__ == "__main__":
-    asyncio.run(main_loop())  print(f"Errore feed: {e}")
-        await asyncio.sleep(1800)
-
-if __name__ == "__main__":
-    asyncio.run(main_loop())_loop())ption as e:
-                print(e)
-        await asyncio.sleep(1800)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_loop())
