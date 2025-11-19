@@ -4,15 +4,21 @@ import yaml
 import deepl
 import ollama
 import re
+import os
+import json
 import torch
 from datetime import datetime
 from aiogram import Bot
 from io import BytesIO
 from dotenv import load_dotenv
-import json
+from diffusers import FluxPipeline
 
-# Carica Flux una volta sola
-pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+# Carica Flux una volta sola all'avvio
+pipe = FluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-schnell",
+    torch_dtype=torch.bfloat16,
+    variant="fp8"  # ultra veloce su A40/4090
+)
 pipe.to("cuda")
 
 load_dotenv()
@@ -20,11 +26,13 @@ load_dotenv()
 with open("config.yaml") as f:
     config = yaml.safe_load(f)
 
-bot = Bot(token=config["bot_token"])
-translator = deepl.Translator(config["deepl_key"])
+bot = Bot(token=os.getenv("BOT_TOKEN"))
+translator = deepl.Translator(os.getenv("DEEPL_KEY"))
 
 SEEN_FILE = "seen.txt"
-seen_ids = set(open(SEEN_FILE).readlines()) if os.path.exists(SEEN_FILE) else set()
+seen_ids = {line.strip() for line in open(SEEN_FILE)} if os.path.exists(SEEN_FILE) else set()
+
+category_map = {"AI": "ai", "CYBER": "cyber", "HARDWARE": "hardware"}
 
 def clean_html(raw):
     return re.sub('<.*?>', '', raw).strip()
@@ -36,25 +44,23 @@ async def process_entry(entry, feed_name):
         return
 
     title_en = entry.title
-    summary_en = entry.summary if 'summary' in entry else entry.get('description', '')
+    summary_en = entry.summary if 'summary' in entry else entry.get('description', '') 
     link = entry.link
 
     prompt = f"""
-Sei un esperto italiano di AI, cybersecurity e hardware estremo.
-Testo originale:
-Titolo: {title_en}
+Sei l'editor italiano di Labirinth, tono underground ma professionale.
+Titolo originale: {title_en}
 Summary: {summary_en[:3500]}
 
-Compito:
-- Decidi categoria: AI, CYBER, HARDWARE o IGNORE (solo se non rilevante)
-- Scrivi titolo italiano accattivante (max 90 caratteri)
-- Scrivi cappello 2-4 righe in italiano perfetto, tono underground/professionale
-- Max 4 hashtag
+Rispondi SOLO con JSON valido:
+{{
+  "category": "AI" or "CYBER" or "HARDWARE" or "IGNORE",
+  "title": "titolo italiano accattivante (max 90 char)",
+  "text": "cappello 2-4 righe italiano perfetto",
+  "hashtags": "#AI #Exploit"
+}}
 
-Rispondi ESATTAMENTE con JSON valido JSON, niente altro testo:
-{{"category": "AI" or "CYBER" or "HARDWARE" or "IGNORE", "title": "...", "text": "...", "hashtags": "#AI #RISC-V"}}
-
-Solo il JSON, niente altro.
+Solo il JSON, niente altro testo.
 """
 
     response = ollama.chat(model='llama3.1:8b', messages=[{'role': 'user', 'content': prompt}])['message']['content'].strip()
@@ -62,52 +68,56 @@ Solo il JSON, niente altro.
     try:
         result = json.loads(response)
     except:
-        print("JSON fallito, skip")
+        print(f"JSON fallito: {response}")
         return
 
-    if result["category"] == "IGNORE":
+    if result.get("category") == "IGNORE":
         return
 
-    category_key = result["category"].lower()  # ai, cyber, hardware
-
-    if category_key not in config["channels"]:
-        print("Categoria non valida")
+    cat_key = category_map.get(result["category"])
+    if not cat_key or cat_key not in config["channels"]:
         return
 
     title_it = translator.translate_text(result["title"], target_lang="IT").text
     text_it = translator.translate_text(result["text"], target_lang="IT").text
+    hashtags = result.get("hashtags", "#Labirinth")
 
-    message = f"*{title_it}*\n\n{text_it}\n\n{result['hashtags']}\n\nFonte: {feed_name}\n→ {link}\n\n@LabirinthTalk"
+    message = f"*{title_it}*\n\n{text_it}\n\n{hashtags}\n\nFonte: {feed_name}\n→ {link}\n\nDiscuti → @LabirinthTalk"
 
-    # Genera immagine cyberpunk
-    image_prompt = f"cyberpunk neon digital art, {title_en.lower()}, dark purple and acid green glow, circuits neural networks minotaur labyrinth theme, dramatic lighting, ultra detailed, no text, 16:9"
-    image = pipe(image_prompt, num_inference_steps=4, guidance_scale=0.0, max_sequence_length=256).images[0]
+    # Genera immagine
+    image_prompt = f"cyberpunk dark neon, {title_en.lower()}, minotaur circuit labyrinth, acid green and deep purple, dramatic lighting, ultra detailed, no text, 16:9"
+    image = pipe(image_prompt, num_inference_steps=4, guidance_scale=0.0).images[0]
 
     buf = BytesIO()
     image.save(buf, format='PNG')
     buf.seek(0)
 
-    # Post completo nella categoria
-    posted = await bot.send_photo(chat_id=config["channels"][category_key], photo=buf, caption=message, parse_mode="Markdown")
+    # Post completo nel canale categoria
+    posted = await bot.send_photo(
+        chat_id=config["channels"][cat_key],
+        photo=buf,
+        caption=message,
+        parse_mode="Markdown"
+    )
 
-    link_to_post = f"https://t.me/{config['channels'][category_key].lstrip('@')}/{posted.message_id}"
+    post_link = f"https://t.me/{config['channels'][cat_key][1:]}/{posted.message_id}"
 
-    teaser = f"*{title_it}* #{result['category']}\n\n{text_it[:150]}...\n\n→ {link_to_post}\n{result['hashtags']} @LabirinthTalk"
+    teaser = f"*{title_it}* #{result['category']}\n\n{text_it[:150]}...\n\n→ {post_link}\n{hashtags}"
 
     await bot.send_message(config["channels"]["main"], teaser, parse_mode="Markdown")
 
-    # Salva per non duplicare
+    seen_ids.add(entry_id)
     with open(SEEN_FILE, "a") as f:
         f.write(entry_id + "\n")
 
-    print(f"Postato: {title_it} → {result['category']}")
+    print(f"Postato → {title_it} [{result['category']}]")
 
 async def main_loop():
     while True:
-        print(f"{datetime.now()} – Scan feed...")
+        print(f"{datetime.now()} → Scan")
         for feed in config["feeds"]:
             d = feedparser.parse(feed["url"])
-            for entry in d.entries[:15]:  # ultimi 15 per sicurezza
+            for entry in reversed(d.entries):  # dal più recente
                 await process_entry(entry, feed["name"])
         await asyncio.sleep(1800)  # 30 min
 
