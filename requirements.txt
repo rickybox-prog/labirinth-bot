@@ -3,7 +3,7 @@ feedparser==6.0.11
 deepl-python==1.9
 pyyaml
 python-dotenv
-torch==2.4.1
 diffusers==0.30.3
 transformers
 accelerate
+ollama
