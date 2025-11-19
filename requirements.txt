@@ -1,9 +1,10 @@
 aiogram==3.13.1
 feedparser==6.0.11
-deepl-python==1.9
+deepl
 pyyaml
 python-dotenv
 diffusers==0.30.3
 transformers
 accelerate
 ollama
+
